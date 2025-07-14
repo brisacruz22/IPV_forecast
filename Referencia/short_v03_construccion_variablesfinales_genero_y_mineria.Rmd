@@ -1,0 +1,968 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+En esta versión tenemos
+a) Base de datos completa en términos temporales (2010-2023)
+b) Aproximación control-tratamiento administrativa, con una ampliación geográfica (distancias al centroide distrital).
+
+# 1. Merge de las bases de datos e identificación de casos tratamiento/control
+
+A continuación, armaremos la muestra de esta investigación, considerando al universo como mujeres en la sierra peruana (peruavian highlands). Para ello, nos basaremos en la región estadística Sierra propuesta por el INEI. Para evitar seleccionar distritos fuera de este alcance, añadimos un segundo filtro en el que [el distrito debe estar a al menos 100 km].
+
+1. Filtrar la endes para que se quede solo en en la sierra (SREGION = 3 (sierra))
+
+2. Primera parte del merge: admnistrativo: match ubigeo de la encuestada y ubigeo del distrito minero, para cada año. Guardar en nuevo df. construir dummy (en_dist_minero para encuestadas)
+
+3. segunda parte del merge: geográfico: con las encuestadas que NO queden en el merge (en_dist_minero = 0), calcular distancias al centroide distrital más cercano
+
+4. Juntar (rbind de) los dos merges (antes crear variables de distancia con 0 automático para la parte administrativa).
+
+## Cargamos bases
+
+```{r}
+
+library(dplyr)
+library(rio)
+
+```
+
+## Creación de una variable que mida el tiempo que un distrito ha sido minero (desde el 2005)
+
+```{r}
+andes = import("tcd_andes_2010_2014.xlsx") %>% 
+  mutate(ubigeo = as.character(ubigeo))
+
+andes_2 = import("tcd_andes_2015_2019.xlsx") %>% 
+  mutate(ubigeo = as.character(ubigeo))
+
+andes_3 = import("tcd_andes_2020_2023.xlsx") %>% 
+  mutate(ubigeo = as.character(ubigeo))
+
+andes_4 = import("tcd_andes_2005_2009.xlsx") %>% 
+  mutate(ubigeo = as.character(ubigeo))
+```
+
+
+```{r}
+andes_full <- rbind(andes,
+                    andes_2,
+                    andes_3,
+                    andes_4)
+```
+
+```{r}
+head(andes_full)
+```
+
+```{r}
+
+andes_full <- andes_full %>%
+  arrange(ubigeo, año) %>%                # ordenar por distrito y año
+  group_by(ubigeo) %>%                    # agrupar por distrito
+  mutate(
+    años_mineros = cumsum(dist_minero == 1)  # cuenta acumulada de años con dist_minero==1
+  ) %>%
+  ungroup()
+
+```
+
+¡Funcionó! A partir de ahora nos quedamos solo con los años que se emparejan con nuestra muestra de la endes (desde el 2010). 
+
+```{r}
+andes_full <- andes_full %>%
+  filter(año > 2009)
+```
+
+
+Crearemos una variable categórica para luego observar la media de producto en cada una.
+
+Variable: años_mineros_categoria
+
+- Menos de 5 años = '1'
+- De 5 a 10 años = '2' 
+- De 11 a más años = '3' 
+
+Haremos otra llamada "nueva_minería", para distinguir los casos con menos de 4 años de historial minero.
+
+```{r}
+library(dplyr)
+
+# 1) Creamos las variables categóricas
+andes_full <- andes_full %>%
+  mutate(
+    años_mineros_categoria = case_when(
+      años_mineros == 0            ~ "0",  # nunca ha sido minero
+      años_mineros < 5             ~ "1",  # Menos de 5 años
+      años_mineros <= 10           ~ "2",  # De 5 a 10 años
+      TRUE                         ~ "3"   # 11 años o más
+    ),
+    # "nueva_minería" = 1 si empezó hace <4 años, 0 en otro caso
+    nueva_minería = if_else(dist_minero == 1 & años_mineros < 4,
+                            "1", "0")
+    )
+
+```
+
+
+```{r}
+# 2) Calculamos la media de producto por cada categoría
+andes_full %>%
+  group_by(años_mineros_categoria) %>%
+  summarise(
+    media_producto = round(mean(producto_mill, na.rm = TRUE), 2),
+    .groups        = "drop"
+  )
+```
+
+Parece que hay una relación directa.
+
+```{r}
+library(ggplot2)
+
+ggplot(
+  andes_full %>% filter(dist_minero == 1),
+  aes(x = años_mineros, y = producto_mill)
+) +
+  geom_point(alpha = 0.6, size = 1.5, color = "steelblue") +
+  labs(
+    title = "Relación entre años de minería y producción minera\n(solo distritos mineros)",
+    x     = "Años con actividad minera",
+    y     = "Producto minero (millones de USD)"
+  ) +
+  theme_bw(base_size = 12)
+```
+
+```{r}
+# 1) Filtrar solo distritos mineros
+df_mineros <- andes_full %>%
+  filter(dist_minero == 1)
+
+# 2) Test de correlación de Pearson entre años_mineros y producto_mill
+pearson_test <- cor.test(
+  x      = df_mineros$años_mineros,
+  y      = df_mineros$producto_mill,
+  method = "pearson",
+  use    = "complete.obs"
+)
+
+# 3) Mostrar resultados
+print(pearson_test)
+```
+
+Y la nueva minería, solo entre mineros
+
+```{r}
+andes_full %>%
+  filter(dist_minero == 1) %>%   # solo distritos mineros
+  group_by(nueva_minería) %>%
+  summarise(
+    media_producto = mean(producto_mill, na.rm = TRUE),
+    .groups        = "drop"
+  )
+
+```
+
+## Creación de una escala de producción minera a nivel distrital 
+
+Crearemos una escala de producción minera a nivel distrital con todos los distritos mineros de los andes peruanos en nuestra ventana de tiempo (2010-2023). Usaremos un método basado en discontinuidades naturales (k-means clustering) sobre la variable de producción para detectar agrupamientos reales. Esta escala es menos arbitraria que quintiles pues deja que los propios datos nos digan dónde están las fronteras entre categorías.
+
+Cálculo 1: gran minería a todos los distritos por encima de la media anual
+
+```{r}
+
+library(dplyr)
+
+andes_full <- andes_full %>%
+  group_by(año) %>%
+  mutate(
+    media_anual = mean(if_else(dist_minero == 1, producto_mill, NA_real_), na.rm = TRUE),
+    gran_mineria = if_else(
+      dist_minero == 1 & producto_mill > media_anual,
+      1L,
+      0L
+    )
+  ) %>%
+  ungroup()
+
+```
+
+
+```{r}
+andes_full %>% 
+  filter(dist_minero == 1) %>% 
+  count(gran_mineria)
+```
+
+Muy pocos distritos quedan como tratamiento, además es muy suceptible a valores extremos.
+
+```{r}
+andes_full = andes_full %>% 
+  select(-media_anual)
+```
+
+
+Cáculo 2: K-means (el elegido)
+
+```{r}
+library(dplyr)
+library(tidyr) 
+
+andes_full <- andes_full %>%
+  group_by(año) %>%
+  group_modify(~{
+    df_year <- .x
+    # Índices de los casos con dist_minero == 1
+    idx_min <- which(df_year$dist_minero == 1)
+    
+    # Inicializar vector con 0s (pequeña/mediana o no aplica)
+    gran_vec <- rep(0L, nrow(df_year))
+    
+    # Si hay al menos 2 observaciones minera, correr k-means
+    if (length(idx_min) >= 2) {
+      set.seed(123)
+      logp      <- log(df_year$producto_mill[idx_min])
+      km        <- kmeans(logp, centers = 2)
+      medios    <- tapply(logp, km$cluster, mean)
+      ord       <- order(medios)
+      # El cluster con mayor media recibe 1 (grande)
+      lab_min   <- ifelse(km$cluster == ord[2], 1L, 0L)
+      gran_vec[idx_min] <- lab_min
+    }
+    
+    df_year$gran_mineria <- gran_vec
+    df_year
+  }) %>%
+  ungroup() %>%
+  # Asegurar que no queden NAs (por si acaso)
+  mutate(
+    gran_mineria = replace_na(gran_mineria, 0L)
+  )
+
+```
+
+
+
+```{r}
+andes_full %>% 
+  filter(dist_minero == 1) %>% 
+  count(gran_mineria)
+```
+
+Ahora sí, nos quedamos con esta operacionalización de gran_minería. Volvemos a separar la muestra para unir en bloques con la endes
+
+```{r}
+
+andes_full = andes_full %>% 
+  mutate(ubigeo = as.integer(ubigeo))
+
+# 2010–2014 → andes
+andes <- andes_full %>% 
+  filter(año >= 2010 & año <= 2014)
+
+# 2015–2019 → andes_2
+andes_2 <- andes_full %>% 
+  filter(año >= 2015 & año <= 2019)
+
+# 2020–2023 → andes_3
+andes_3 <- andes_full %>% 
+  filter(año >= 2020 & año <= 2023)
+  
+```
+
+
+## Importar datos de la ENDES
+
+```{r}
+full_endes = import("outcomes_endes_10_14.CSV")
+
+full_endes = full_endes %>% 
+  filter(SREGION == 3) # Nos quedamos solo con la región estadística "SIERRA"
+
+```
+
+```{r}
+full_endes_2 = import("outcomes_endes_15_19.csv") %>% 
+   filter(SREGION == 3)
+```
+
+```{r}
+full_endes_3 = import("outcomes_endes_20_23.csv") %>% 
+  filter(SREGION == 3) %>% 
+  select(!HHID) %>% 
+  mutate(ubigeo = as.character(ubigeo))
+
+```
+
+## Unión con cada bloque (endes-minería), actualizado.
+
+```{r}
+gender_andes <- full_endes %>%
+  full_join(andes, by = c("ubigeo", "año"))
+
+gender_andes = gender_andes %>% 
+  select(-DEPARTAMENTO)
+
+gender_andes =
+  gender_andes[!is.na(gender_andes$CASEID),] # quitamos los casos que no tienen un match
+
+```
+
+```{r}
+sum(is.na(gender_andes$producto)) 
+```
+Hay 183 casos donde el filtro de 1000 msnm en distritos deja sin par a la encuestada en la ENDES.
+
+```{r}
+gender_andes_2 <- full_endes_2 %>%
+  full_join(andes_2, by = c("ubigeo", "año"))
+
+gender_andes_2 = gender_andes_2 %>% 
+  select(-DEPARTAMENTO)
+
+gender_andes_2 =
+  gender_andes_2[!is.na(gender_andes_2$CASEID),] # quitamos los casos que no tienen un match
+
+```
+
+```{r}
+sum(is.na(gender_andes_2$producto)) 
+```
+En este grupo, hay 29 casos donde el filtro de 1000 msnm en distritos deja sin par a la encuestada en la ENDES.
+
+```{r}
+gender_andes_3 <- full_endes_3 %>%
+  mutate(ubigeo = as.integer(ubigeo)) %>% 
+  full_join(andes_3, by = c("ubigeo", "año"))
+
+gender_andes_3 = gender_andes_3 %>% 
+  select(-DEPARTAMENTO)
+
+gender_andes_3 =
+  gender_andes_3[!is.na(gender_andes_3$CASEID),] 
+```
+
+Ahora juntamos los tres periodos.
+
+```{r}
+gender_andes = rbind(gender_andes, gender_andes_2, gender_andes_3)
+```
+
+Hasta el momento tenemos 155 116 casos para 2010-2023.
+
+### a. Identificación administrativa 
+
+Vamos a separar la muestra que cumplen con todos nuestros criterios administrativos de tratamiento (para enfoques centrados en minería grande y también general), y a guardar la muestra restante. Ojo que a este punto a muestra está casi cerrada, solo estamos manipulando el criterio de identificación de tratamiento/control.
+
+```{r}
+# primero, nos aseguramos de que esta sea nuestra muestra final
+# Aplicamos un filtro para conservar solo los casos que cuentan con datos completos en dos variables esenciales para nuestro approach.
+
+gender_andes <- gender_andes %>%
+  filter(if_all(all_of(c("longitudx", "latitudy", "gran_mineria")), ~ !is.na(.)))
+
+gender_andes = gender_andes %>% 
+  mutate(gran_min= gran_mineria)
+  
+```
+
+
+```{r}
+control_admin <- # casos que cumplen con el criterio administrativo de tratamiento
+  gender_andes %>% 
+  filter(gran_min == 1) %>% 
+  mutate(
+    distancia_km_gran = 0, # creamos variables que usaremos más adelante
+    distancia_km_general = 0,
+    imput_ubigeo_gran = 0
+  )
+# agregamos estas variables SIN valor, porque este grupo NO tiene ubigeos (distritos) imputados
+
+geo_identificacion <- gender_andes %>% 
+  filter(gran_min != 1) # casos que NO cumplen con el criterio (luego subdividimos)
+
+```
+
+
+Ahora vamos a aplicar la identificación por criterios geográficos a la muestra que no cumplió con el criterio administrativo (complementar).
+
+### b. Identificación geográfica (distancias)
+
+Prueba de cálculo de distancias. A continuación ejecutamos el comando más eficiente para ello, pero antes, comparamos su rendimiento (resultado y tiempo) con otro muy parecido, con el que se calcularon las distancias en un inicio.
+
+```{r}
+
+# 0. Configuración inicial
+set.seed(123)
+sub_muestra <- gender_andes %>% 
+  sample_n(200)
+
+library(sf)
+
+crs_wgs84 <- 4326  # CRS geográfico (lat/lon)
+crs_utm <- 32718   # CRS proyectado (metros)
+
+# Preparar datos espaciales
+
+
+distritos_sf <- andes_full %>% 
+  rename(gran_min = gran_mineria) %>% 
+  filter(dist_minero == 1) %>%  # Todos los distritos mineros
+  st_as_sf(coords = c("longitud", "latitud"), crs = crs_wgs84) %>% 
+  st_transform(crs_utm)
+
+sub_muestra <- sub_muestra %>% 
+  filter(!is.na(longitudx) & !is.na(latitudy)) %>% 
+  # 1. COPIA para la geometría (usando las originales)
+  mutate(
+    lon_geom = longitudx,
+    lat_geom = latitudy
+  ) %>% 
+  # 2. Usar las COPIA para crear la geometría (las originales se conservan)
+  st_as_sf(coords = c("lon_geom", "lat_geom"), crs = crs_wgs84) %>% 
+  st_transform(crs_utm)
+
+
+# 2. Calculamos con matriz que luego extrae la mínima (en km)
+dist_matrix_1 <- st_distance(sub_muestra$geometry, distritos_sf$geometry)
+dist_min_matrix_km <- apply(dist_matrix_1, 1, min) / 1000
+
+# 3. Calculamos con nearest_feature + by_element (en km)
+nearest_idx       <- st_nearest_feature(sub_muestra$geometry, distritos_sf$geometry)
+dist_by_elem_km   <- as.numeric(
+                       st_distance(
+                         sub_muestra$geometry,
+                         distritos_sf[nearest_idx, ],
+                         by_element = TRUE
+                       )
+                     ) / 1000
+
+# 4. Comparación
+library(dplyr)
+tibble(
+  via_matriz   = dist_min_matrix_km,
+  via_nearest  = dist_by_elem_km,
+  diff         = via_matriz - via_nearest
+) %>% 
+  summarise(
+    max_diff = max(abs(diff), na.rm = TRUE),
+    mean_diff = mean(diff, na.rm = TRUE)
+  )
+
+```
+
+Efectivamente, los resultados son los mismos. Entonces usamos el que menos capacidad computacional conlleva: st_nearest_feature + st_distance.
+
+```{r}
+# Primera parte: crear variable de distancias reales
+library(dplyr)
+library(sf)
+
+# -------------------------------------------------------------------------
+# 0. Configuración inicial
+# -------------------------------------------------------------------------
+crs_wgs84 <- 4326  # CRS geográfico (lat/lon)
+crs_utm <- 32718   # CRS proyectado (metros)
+
+# -------------------------------------------------------------------------
+# 1. Preparar datos espaciales
+# -------------------------------------------------------------------------
+# Convertir TODOS los distritos mineros a objeto espacial
+
+distritos_sf <- andes_full %>% 
+  rename(gran_min = gran_mineria) %>% 
+  filter(dist_minero == 1) %>%  # Todos los distritos mineros
+  st_as_sf(coords = c("longitud", "latitud"), crs = crs_wgs84) %>% 
+  st_transform(crs_utm)
+
+# Filtrar solo distritos de GRAN minería (para enfoque específico)
+distritos_gran_sf <- distritos_sf %>% 
+  filter(gran_min == 1)
+
+# Convertir Centros Poblados (CP) a objeto espacial
+cp_sf <- geo_identificacion %>% 
+  # 1. COPIA para la geometría (usando las originales)
+  mutate(
+    lon_geom = longitudx,
+    lat_geom = latitudy
+  ) %>% 
+  # 2. Usar las COPIA para crear la geometría (las originales se conservan)
+  st_as_sf(coords = c("lon_geom", "lat_geom"), crs = crs_wgs84) %>% 
+  st_transform(crs_utm)
+
+geo_gran <- cp_sf %>% 
+  filter(dist_minero == 1)
+
+geo_general <- cp_sf %>% 
+  filter(dist_minero == 0)
+
+setdiff(names(geo_general), names(geo_gran))  # ambos df son iguales
+
+
+```
+
+```{r}
+# -------------------------------------------------------------------------
+# 2. Calcular distancias al vecino más cercano: estándar y gran minería
+# -------------------------------------------------------------------------
+
+# 2.1 creamos la función
+
+calcular_distancias_anual <- function(cp_subset, all_distritos_sf, suffix = "") {
+  cp_subset %>%
+    group_by(año) %>%  
+    group_modify(~ {
+      # Filtrar distritos del año actual y extraer atributos clave
+      distritos_año <- all_distritos_sf %>% 
+        filter(año == .y$año) %>% 
+        select(ubigeo)
+      
+      .x %>%
+        mutate(
+          # Índice del distrito más cercano
+          dist_cercano = st_nearest_feature(geometry, distritos_año$geometry),
+          # Extraer atributos del distrito más cercano
+          imput_ubigeo = distritos_año$ubigeo[dist_cercano],
+          # Calcular distancia con sufijo personalizado
+          !!paste0("distancia_km", suffix) := 
+            as.numeric(st_distance(geometry, distritos_año[dist_cercano, ], by_element = TRUE)) / 1000
+        ) 
+    }) %>% 
+    ungroup() %>% 
+    select(-dist_cercano)
+}
+
+# aplicamos la función
+
+# Solo necesita distancia a GRAN minería (distancia_gran_min_km)
+
+geo_gran <- geo_gran %>% 
+  calcular_distancias_anual(
+    all_distritos_sf = distritos_gran_sf,  # Solo gran minería
+    suffix = "_gran"
+  ) %>% 
+  rename(
+    # Renombrar atributos del distrito minero más cercano (gran minería)
+    imput_ubigeo_gran = imput_ubigeo
+  ) %>% 
+  mutate(
+    distancia_km_general = 0,  # Por estar en distrito minero (sin importar escala)
+  )
+
+# Necesita distancia a TODA minería (distancia_min_km) y a GRAN minería (distancia_gran_min_km)
+
+geo_general <- geo_general %>% 
+  calcular_distancias_anual( 
+  # Distancia a GRAN minería (atributos del distrito GRAN minero más cercano)
+    all_distritos_sf = distritos_gran_sf,
+    suffix = "_gran"
+  ) %>% 
+  rename(
+    imput_ubigeo_gran = imput_ubigeo
+  ) %>%
+  # Distancia a TODA minería (atributos del distrito minero más cercano)
+  calcular_distancias_anual(
+    all_distritos_sf = distritos_sf,  # Todos los distritos
+    suffix = "_general")
+
+# -------------------------------------------------------------------------
+# 4. Consolidar todo en un dataframe único
+# -------------------------------------------------------------------------
+
+# ANTES
+# devolvemos los 2 objetos a formato dataframe
+
+geo_gran <- st_drop_geometry(geo_gran)
+geo_general <- st_drop_geometry(geo_general)
+
+geo_general <- geo_general %>% 
+  select(-geometry)
+geo_gran <- geo_gran %>% 
+  select(-geometry)
+geo_general <- geo_general %>% 
+  select(-imput_ubigeo)
+
+# ahora sí, a juntar
+geo_gender_andes <- rbind(
+  geo_gran,
+  geo_general) 
+
+# juntamos identificación administrativa e identificación geográfica.
+
+final_gender_andes <- rbind(
+  geo_gender_andes,
+  control_admin)
+
+```
+
+
+Ahora vamos a crear otras variables a partir de esta primera identificación: Variables dicotómicas de influencia (control/tratamiento)
+
+```{r}
+library(dplyr)
+library(purrr)
+
+# Umbrales que vamos a evaluar
+thresholds <- c(5, 10, 15, 20, 25, 30)
+
+# Función auxiliar que construye las tres dummies para un umbral dado
+add_influencias <- function(df, t) {
+  df %>% 
+    mutate(
+      !!paste0("influencia_",        t) := if_else(distancia_km_general   <= t, 1L, 0L, missing = 0L),
+      !!paste0("influencia_gran_",   t) := if_else(distancia_km_gran      <= t, 1L, 0L, missing = 0L)
+    )
+}
+
+# Función para cada umbral
+final_gender_andes <- reduce(thresholds, add_influencias, .init = final_gender_andes)
+
+```
+
+Ahora, nuestro dataframe incluye:
+
+a) Variables de influencia basadas en la distancia “bruta” (distancia_km_general)
+
+  - influencia_5, influencia_10, influencia_15, influencia_20, influencia_25, influencia_30
+  - Toman valor 1 si el centro poblado (CP) se ubica dentro de n km del centroide distrital minero, 0 en caso        contrario.
+
+b) Variables de influencia relativas solo a minería distrital 'grande' (distancia_km_gran)
+
+  - influencia_gran_5, influencia_gran_10, influencia_gran_15, influencia_gran_20, influencia_gran_25,              influencia_gran_30
+  - Identifican la cercanía al centroide del distrito minero catalogado como “gran minería”.
+
+c) Variables de distancia continua (en km)
+
+  - distancia_km_general, distancia_imputada_km, distancia_km_gran
+
+**NOTA**: estamos obviando la distancia al centroide de distrito para los casos que ya están a dentro del distrito minero. Es importante hacer ese ajuste porque sino estaríamos midiendo el efecto de la distancia al centroide de un distrito (aunque sea minero) y no el efecto de lo que entendemos como "influencia minera", y agregaríamos ruido innecesario a nuestra estimación.
+
+
+```{r}
+
+# comprobamos que quienes viven en distritos mineros tienen 0 de distancia al centroide. 
+final_gender_andes %>%
+  group_by(dist_minero) %>%
+  summarise(
+    media_dist_km = round(mean(distancia_km_general, na.rm = TRUE), 2),
+    .groups = "drop"
+  )
+```
+
+Ahora veamos cómo crecen nuestros casos control con esta nueva estrategia de identificación.
+
+```{r}
+
+final_gender_andes %>%
+  st_drop_geometry() %>%  
+  group_by(dist_minero) %>%
+  summarise(casos = n()) %>%
+  mutate(percent = (casos / sum(casos)) * 100)
+
+```
+
+
+```{r}
+final_gender_andes %>%
+  st_drop_geometry() %>% 
+  group_by(influencia_5) %>%
+  summarise(casos = n()) %>%
+  mutate(porcentajes = (casos / sum(casos)) * 100)
+```
+
+```{r}
+final_gender_andes %>%
+  st_drop_geometry() %>% 
+  group_by(influencia_10) %>%
+  summarise(casos = n()) %>%
+  mutate(porcentajes = (casos / sum(casos)) * 100)
+```
+
+```{r}
+final_gender_andes %>%
+  st_drop_geometry() %>% 
+  group_by(influencia_15) %>%
+  summarise(casos = n()) %>%
+  mutate(porcentajes = (casos / sum(casos)) * 100)
+```
+
+
+```{r}
+final_gender_andes %>%
+  st_drop_geometry() %>% 
+  group_by(influencia_gran_5) %>%
+  summarise(casos = n()) %>%
+  mutate(porcentajes = (casos / sum(casos)) * 100)
+```
+```{r}
+final_gender_andes %>%
+  st_drop_geometry() %>% 
+  group_by(influencia_gran_10) %>%
+  summarise(casos = n()) %>%
+  mutate(porcentajes = (casos / sum(casos)) * 100)
+```
+```{r}
+final_gender_andes %>%
+  st_drop_geometry() %>% 
+  group_by(influencia_gran_15) %>%
+  summarise(casos = n()) %>%
+  mutate(porcentajes = (casos / sum(casos)) * 100)
+```
+```{r}
+final_gender_andes %>%
+  st_drop_geometry() %>% 
+  group_by(influencia_gran_20) %>%
+  summarise(casos = n()) %>%
+  mutate(porcentajes = (casos / sum(casos)) * 100)
+```
+
+# 2. Construcción de variables finales
+
+
+```{r}
+### 1. Incidencia de violencia conyugal (en los últimos 12 meses)
+
+# violencia
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(violencia = case_when(
+    D103B %in% c(1, 2) | D105A %in% c(1, 2) | D105B %in% c(1, 2) | 
+      D105C %in% c(1, 2) | D105D %in% c(1, 2) | D105E %in% c(1, 2) | 
+      D105F %in% c(1, 2) | D105G %in% c(1, 2) | D105H %in% c(1, 2) | 
+      D105I %in% c(1, 2) ~ 1,  
+    rowSums(!is.na(select(., D103B, D105A, D105B, D105C, D105D, D105E, 
+                          D105F, D105G, D105H, D105I))) == 0 ~ NA_real_, # si TODOS son NA, entonces NA
+    TRUE ~ 0 
+  ))
+
+### 2. Nivel educativo (secundaria completa)
+
+# sec_completa
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(sec_completa = ifelse(V106 %in% c(2, 3), 1, 0))
+
+### 3. Nivel educativo (superior)
+
+# ed_superior
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(ed_superior = ifelse(V106 == 3, 1, 0))
+
+### 4. Aceptación de la violencia doméstica contra las mujeres
+
+# justifica_violencia
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(justifica_violencia = case_when(
+    # Si alguna de V744A a V744E es 1, asignar 1 (Sí)
+    rowSums(select(., V744A:V744E) == 1, na.rm = TRUE) > 0 ~ 1,
+    
+    # Si todas las variables V744A a V744E son 0, asignar 0 (No)
+    rowSums(select(., V744A:V744E) == 0, na.rm = TRUE) == 5 ~ 0,
+    
+    # En cualquier otro caso, asignar NA (incluyendo 8, 9, o mezclas de 0 y NA)
+    TRUE ~ NA_real_
+  ))
+```
+
+### 5. Lengua materna
+
+lm_indigena
+
+```{r}
+final_gender_andes <- final_gender_andes %>%
+  mutate(lm_indigena = ifelse(S119 %in% c(2, # quechua
+                                          3, # aymara
+                                          4 # otra lengua ind
+                                          ), 1, 0))
+```
+
+## 6. Violencia entre padres: sabe si su padre golpeaba a su madre
+
+D121 * se interpreta como episodios ocurridos en su niñez/adolescencia; antecedentes de violencia familiar
+ 
+```{r}
+# recodificamos los 8s (no sabe) por 0s
+final_gender_andes <- final_gender_andes %>%
+  mutate(D121 = ifelse(D121 == 1, 1, 0))
+```
+
+
+## 7. Desempleo del compañero
+
+desempleo_esposo (compañero)
+
+```{r}
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(desempleo_esposo = ifelse(V705 == 0, 1, 0))
+
+```
+
+## 8. Gana más que el compañero por su trabajo
+
+gana_mas (que el compañero)
+
+```{r}
+final_gender_andes <- final_gender_andes %>%
+  mutate(gana_mas = ifelse(V746 == 1, 1, ifelse(V746 == 8 | is.na(V746), NA_real_, 0)))
+```
+
+
+```{r}
+final_gender_andes <- final_gender_andes %>%
+  mutate(
+    # 9. Nivel educativo (secundaria completa) del compañero
+    esposo_sec_completa = ifelse(V701 %in% c(2, 3), 1, ifelse(is.na(V701), NA_real_, 0)),
+    
+    # 10. Nivel educativo (superior) del compañero
+    esposo_ed_superior = ifelse(V701 == 3, 1, ifelse(is.na(V701), NA_real_, 0)),
+    
+    # 11. Toma de decisiones del hogar: conjunta (índice agregado simple del 0 al 6)
+    deciden_juntos = rowSums(select(., V743A:V743F) == 2, na.rm = TRUE),
+    
+    # 12. Compañero se embriaga con frecuencia o a veces (recodificación de D114)
+    D114 = ifelse(D114 > 0, 1, ifelse(is.na(D114), NA_real_, 0)),
+    
+    # 13. Autonomía en salud reproductiva (removida en la versión final)
+    #auton_sr = ifelse(V632 == 2 | V632 == 6, 1, ifelse(is.na(V632), NA_real_, 0)),
+    
+    # 14. Control en el cuidado de la salud
+    control_salud = ifelse(V743A == 0 | V743A == 4 | V743A == 5 | V743A == 6, 
+                           1, ifelse(is.na(V743A), NA_real_, 0)),
+    
+    # 15. Participación en decisiones del hogar (compras)
+    control_material = ifelse(V743B == 0 | V743B == 4 | V743B == 5 | V743B == 6 |
+                                V743C == 0 | V743C == 4 | V743C == 5 | V743C == 6, 
+                              1, ifelse(is.na(V743B) & is.na(V743C), NA_real_, 0)),
+    
+    # 16. Autonomía en relaciones sociales (eliminada en la versión final)
+    #auton_rrss = ifelse(V743D == 0 | V743D == 4 | V743D == 5 | V743D == 6, 
+                       # 1, ifelse(is.na(V743D), NA_real_, 0)),
+    
+    # 17. Amenazas en la libertad de afiliación
+    across(c(D101A, D101C, D101D), ~ifelse(. == 8, NA_real_, .)),  # Recodificar 8 como NA
+    amenaza_lib = ifelse(D101A == 1 | D101C == 1 | D101D == 1, 
+                         1, ifelse(is.na(D101A) & is.na(D101C) & is.na(D101D), NA_real_, 0)),
+    
+    # 18. Percepción de ingresos por actividades laborales (actualizada)
+    percepcion_ingresos = ifelse(V741 == 0 | V741 == 3, 
+                              1, ifelse(is.na(V741), NA_real_, 0)),
+    autonom_ingresos = ifelse(V739 == 4 | V739 == 5, 
+                              1, ifelse(is.na(V739), NA_real_, 0))
+  )
+
+```
+
+```{r}
+sum(is.na(final_gender_andes$percepcion_ingresos))
+sum(is.na(final_gender_andes$D114))
+```
+
+## .19 Migrante
+
+
+```{r}
+final_gender_andes <- final_gender_andes %>%
+  mutate(V104 = ifelse(V104 %in% c(97, # Inconsistente
+                                   98 # No sabe
+                                   ), NA, V104))
+# migrante (versión simple y estándar)
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(migrante = ifelse(V104 == 95 | V104 >= 5, 0, 1))
+
+
+# migrante versión compleja
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(migrante_av = ifelse(V104 == 95 | 
+                             V104 > 0.5 * V012, 0, 1)) # haber residido en el dist. más del 50% de su edad
+```
+
+
+```{r}
+## 20. Ha trabajado en el último año
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(trabaja = case_when(
+    V731 == 1 | V731 == 2 | V731 == 3 ~ 1,  
+    is.na(V731) ~ NA_real_, 
+    TRUE ~ 0  
+  ))
+
+## 21. Trabaja en agro
+
+#agro_trabajo
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(agro_trabajo = case_when(
+    V717 == 4 | V717 == 5  ~ 1,
+    is.na(V717) ~ NA_real_, 
+    TRUE ~ 0  
+  ))
+
+
+## 22. Trabaja en servicios
+
+#serv_trabajo
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(serv_trabajo = case_when(
+    V717 == 3 | V717 == 7  ~ 1,
+    is.na(V717) ~ NA_real_, 
+    TRUE ~ 0))
+
+## 22. Trabaja Sin habilidades Manuales (unskilled labor)
+
+# sinhh_trabajo
+
+final_gender_andes <- final_gender_andes %>%
+  mutate(sinhh_trabajo = case_when(
+    V717 == 9 ~ 1,
+    is.na(V717) ~ NA_real_, 
+    TRUE ~ 0))  
+
+```
+
+Otras covariables
+
+```{r}
+final_gender_andes <- final_gender_andes %>%
+  mutate(
+    # Mujer jefa del hogar (HV101 == 1)
+    mujer_jefa = if_else(HV101 == 1, 1, 0, missing = NA_real_),
+
+    # Casada o conviviente (V501 == 1 o 2)
+    casada_conviviente = if_else(V501 %in% c(1, 2), 1, 0, missing = NA_real_),
+
+    # Esposo vive en casa (V504 == 1) solo si hay esposo
+    esposo_en_casa = case_when(
+      V501 %in% c(1, 2) & V504 == 1 ~ 1,
+      V501 %in% c(1, 2) & V504 == 2 ~ 0,
+      TRUE ~ NA_real_  # para mujeres sin esposo/conviviente
+    )
+  )
+```
+
+
+**Listo. Variables de género creadas.** 
+
+Ahora exportamos las bases de datos para nuestros indicadores. Recordemos que nuestra muestra varía según si el indicador está dirigido a mujeres casadas o conviviendo.
+
+
+```{r}
+
+# install.packages("openxlsx")
+library(openxlsx)
+
+# Premuestra para mujeres en general (15-49)
+write.xlsx(final_gender_andes,"df_COMPLETO_2010_23_vf.xlsx", 
+           rowNames = FALSE) # esto es para que el índice no se guarde como una columna de datos
+```
+
+
+Lo logramos. 14 años de información sobre bienestar femenino y actividad minera.
+

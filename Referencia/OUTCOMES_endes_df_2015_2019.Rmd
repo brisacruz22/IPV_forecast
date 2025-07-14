@@ -1,0 +1,626 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Empecemos. En este caso, **queremos un gran DF con todas nuestras variables dependientes o outcomes**. No nos importa tener NAs.
+
+El plan es llamar todos los rec, borrar los na y unirlos, luego, embutirle la selección de variables. Luego, hacer lo mismo para los otros años y luego unir cada uno.
+
+Todo esto se hace teniendo como referencia a una tabla de variables seleccionadas.
+
+Es importante precisar que no se hace un loop debido a que los nombres de las variables e incluso su propia disponibilidad varía de año a año. En particular para el código de ubigeo, se tuvo que identificar con un merge geográfico a partir de las coordendas del centro poblado de la encuestada. Hacer la importación manualmente, además, asegura conocer a detalle la estructura del DF que estaremos usando y las particularidades de sus variables.
+
+# 2015
+
+```{r}
+# Cargar librería
+library(haven)
+library(dplyr)
+library(rio)
+
+# Importar archivos SAV a nivel individual / mujer
+RE516171 <- read_sav('ENDES_2015/RE516171.sav')
+REC83 <- read_sav('ENDES_2015/REC83.sav')
+REC84DV <- read_sav('ENDES_2015/REC84DV.sav')
+REC91 <- read_sav('ENDES_2015/REC91.sav')
+REC0111 <- read_sav('ENDES_2015/REC0111.sav')
+
+# Importar SAV a nivel hogar
+# De antemano, sabemos que nos interesan muy pocas variables de este grupo
+# Así que las seleccionamos desde aquí para optimizar
+
+RECH23 = import("ENDES_2015/RECH23.SAV")%>% 
+  select(HHID, # identificador
+         HV206) # ss bb
+# omitimos HV202 por tener muchos NAs para este año
+
+RECH0 = import("ENDES_2015/RECH0.SAV")%>% 
+  select(HHID, # identificadores
+         HV024,
+         longitudx, # Tomamos las coordenadas para el futuro análisis georreferenciado
+         latitudy)
+RECH1 <- import("ENDES_2015/RECH1.SAV") %>% 
+  select(HHID, HV101, HVIDX) %>% 
+  mutate(
+    # CASEID = HHID concatenado con HVIDX formateado a 3 caracteres (espacios a la izquierda)
+    CASEID = paste0(HHID, sprintf("%3s", HVIDX))
+  ) %>% 
+  select(-HHID, -HVIDX)
+
+```
+
+
+```{r}
+# Realizamos el merge (a partir de CASEID)
+
+# Primero, unimos todos los archivos a nivel individual
+
+full_endes_2015 <- merge(RE516171, REC83, by = "CASEID", all = TRUE) %>%
+  merge(REC84DV, by = "CASEID", all = TRUE) %>%
+  merge(REC91, by = "CASEID", all = TRUE) %>%
+  merge(REC0111, by = "CASEID", all = TRUE) %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+endes_2015 <- full_endes_2015 %>%
+  mutate(HHID = substr(CASEID, 1, 15)) %>% # Tomamos el código identificador de hogar, servirá para el merge
+  select(SPROVIN,
+         SDISTRI,
+         SREGION,
+         HHID, 
+         CASEID,
+         V005, # factor de expansión
+         V001, # factor de expansión
+         V022, # factor de expansión
+         D103B, 
+         D105A:D105I, 
+         V012, 
+         V106, 
+         V133, 
+         D121, 
+         V744A:V744E, 
+         V705, 
+         V746, 
+         V701, 
+         V731, 
+         V743A:V743F, 
+         S119, 
+         D114, 
+         V102, 
+         V632,
+         V104,
+         V717,
+         V741,
+         V501, V504,
+         S325D, V743A:V743D, D101A, D101C, D101D, V739,
+         V190) # Wealth index
+```
+
+
+```{r}
+# Luego, unimos los de nivel hogar
+hogar_2015 <- RECH23 %>%
+  full_join(RECH0, by = "HHID") # Identificador a nivel de hogar
+
+# Ahora juntamos ambos niveles de datos usando el HHID que creamos para el nivel individual
+
+endes_2015 <- endes_2015 %>%
+  left_join(hogar_2015, by = "HHID") %>%
+  left_join(RECH1,        by = "CASEID") %>%
+  distinct(CASEID, .keep_all = TRUE)
+```
+
+El único filtro que hacemos por NAs es en coordenadas, porque solo a partir del distrito es que podemos identificar una de nuestras variables centrales, la influencia minera, y para ello son imprescindibles las variables de coordenadas.
+
+```{r}
+# Eliminar casos con NA en la columna longitudx
+endes_2015 <- endes_2015 %>%
+  filter(!is.na(longitudx))
+```
+
+```{r}
+sum(is.na(endes_2015$HV101)) # comprobamos
+```
+
+Nos quedamos con 36 656 casos (no necesariamente completos) en la ENDES 2015. Vamos al siguiente paso
+
+Necesitamos construir la variable de **Ubigeo** o código distrital, a partir de 3 variables que vienen en la base de datos. Nota: usamos el código de región en la base de hogar (y no de la individual) porque esa tiene 0 NAs, mientras que en la individual hay 889 NAs.
+
+1. Agregar 0s adelante en donde falte (para región, provincia y distrito)
+2. Crear var ubigeo, que sea la unión de los valores de las 3 variables
+
+**Crearemos una función para hacer esto**
+
+```{r}
+
+ubigeo <- function(df) {
+  df %>%
+    mutate(
+      HV024 = ifelse(!is.na(HV024) & nchar(HV024) == 1, 
+                     paste0("0", HV024), HV024), # código de región
+      SPROVIN = ifelse(!is.na(SPROVIN) & nchar(SPROVIN) == 1, 
+                       paste0("0", SPROVIN), SPROVIN), # código provincial
+      SDISTRI = ifelse(!is.na(SDISTRI) & nchar(SDISTRI) == 1, 
+                       paste0("0", SDISTRI), SDISTRI), # código distrital
+      ubigeo = paste0(HV024, SPROVIN, SDISTRI)
+    )
+}
+
+# endes_2015_prueba <- ubigeo(endes_2015) # Verificamos que funciona bien
+
+# Creamos variable ubigeo usando nuestra función, a partir de 3 vars de la encuesta
+endes_2015 <- ubigeo(endes_2015)
+# Ahora podemos dejar de lado las variables que no nos dan información relevante
+endes_2015 <- endes_2015 %>% 
+  select(-c(HHID, SPROVIN, SDISTRI))
+
+```
+
+
+```{r}
+sum(is.na(endes_2015$SDISTRI))
+sum(is.na(endes_2015$SPROVIN))
+sum(is.na(endes_2015$HV024))
+#sum(is.na(endes_2015_prueba$SDISTRI)) comparamos NAs para detectar errores por el uso de la función
+```
+Nuestra función es impecable.
+
+```{r}
+# Eliminar casos con NA en la columna ubigeo
+# endes_2015 <- endes_2015 %>% filter(!is.na(ubigeo()))
+sum(is.na(endes_2015$ubigeo))
+
+```
+
+Listo!
+
+Ahora repetimos lo mismo para los siguientes años:
+
+# 2016
+
+El siguiente proceso consiste en llamar a los mismos módulos pero para diferentes años, lo que implica que estaremos usando los mismos nombres de los archivos SAV, aunque cada uno sea para un año distinto.
+
+
+```{r}
+
+RE516171 <- read_sav('ENDES_2016/RE516171.sav')
+REC83 <- read_sav('ENDES_2016/REC83.sav')
+REC84DV <- read_sav('ENDES_2016/REC84DV.sav')
+REC91 <- read_sav('ENDES_2016/REC91.sav')
+REC0111 <- read_sav('ENDES_2016/REC0111.sav')
+RECH1 <- read_sav('ENDES_2016/RECH1.sav')
+
+RECH23 = import("ENDES_2016/RECH23.SAV")%>% 
+  select(HHID, # identificador
+         HV206) # ss bb (tomaremos riqueza de otro módulo con otro nombre porque no aparece como V270)
+
+RECH0 = import("ENDES_2016/RECH0.SAV")%>% 
+  select(HHID,
+         HV024,
+        longitudx, # en este año TAMPOCO hay UBIGEO así que preliminarmente tomamos las coordenadas
+         latitudy)
+
+RECH1 <- import("ENDES_2016/RECH1.SAV") %>% 
+  select(HHID, HV101, HVIDX) %>% 
+  mutate(
+    # CASEID = HHID concatenado con HVIDX formateado a 3 caracteres (espacios a la izquierda)
+    CASEID = paste0(HHID, sprintf("%3s", HVIDX))
+  ) %>% 
+  select(-HHID, -HVIDX)
+
+```
+
+Repetimos todos los pasos de 2015.
+
+```{r}
+full_endes_2016 <- merge(RE516171, REC83, by = "CASEID", all = TRUE) %>%
+  merge(REC84DV, by = "CASEID", all = TRUE) %>%
+  merge(REC91, by = "CASEID", all = TRUE) %>%
+  merge(REC0111, by = "CASEID", all = TRUE) %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+endes_2016 <- full_endes_2016 %>%
+  mutate(HHID = substr(CASEID, 1, 15)) %>% # Tomamos el código identificador de hogar, servirá para el merge
+  select(SPROVIN,
+         SDISTRI,
+         SREGION,
+         HHID,
+         CASEID,
+         v005, # factor de expansión (cambia a v minúscula)
+         V001, # factor de expansión
+         V022, # factor de expansión
+         D103B, 
+         D105A:D105I, 
+         V012, 
+         V106, 
+         V133, 
+         D121, 
+         V744A:V744E, 
+         V705, 
+         V746, 
+         V701, 
+         V731, 
+         V743A:V743F, 
+         S119, 
+         D114, 
+         V102, 
+         V632,
+         V104,
+         V717,
+         V741,
+         V501, V504,
+         S325D, V743A:V743D, D101A, D101C, D101D, V739,
+         V190) # índice de riqueza
+
+# Luego, unimos los de nivel hogar
+hogar_2016 <- RECH23 %>%
+  full_join(RECH0, by = "HHID") # Identificador a nivel de hogar
+
+# Ahora juntamos ambos niveles de datos usando el HHID que creamos para el nivel individual
+
+endes_2016 <- endes_2016 %>%
+  left_join(hogar_2016, by = "HHID") %>%
+  left_join(RECH1,        by = "CASEID") %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+# Eliminar casos con NA en la columna longitudx
+endes_2016 <- endes_2016 %>%
+  filter(!is.na(longitudx))
+```
+
+Nos quedamos con 34 132 casos (no necesariamente completos) en la ENDES 2016. Vamos al siguiente paso.
+
+```{r}
+# Creamos variable ubigeo usando nuestra función, a partir de 3 vars de la encuesta
+endes_2016 <- ubigeo(endes_2016)
+# Ahora podemos dejar de lado las variables que no nos dan información relevante
+endes_2016 <- endes_2016 %>% 
+  select(-c(HHID, SPROVIN, SDISTRI))
+```
+
+Listo!
+
+
+# 2017
+
+```{r}
+RE516171 <- read_sav('ENDES_2017/RE516171.sav')
+REC83 <- read_sav('ENDES_2017/REC83.sav')
+REC84DV <- read_sav('ENDES_2017/REC84DV.sav')
+REC91 <- read_sav('ENDES_2017/REC91.sav')
+REC0111 <- read_sav('ENDES_2017/REC0111.sav')
+RECH1 <- read_sav('ENDES_2017/RECH1.sav')
+
+RECH23 = import("ENDES_2017/RECH23.SAV")%>% 
+  select(HHID, # identificador
+         HV206) # ss bb
+
+RECH0 = import("ENDES_2017/RECH0.SAV")%>% 
+  select(HHID, 
+         HV024,
+         long_ccpp, 
+         lat_ccpp)
+
+RECH1 <- import("ENDES_2017/RECH1.SAV") %>% 
+  select(HHID, HV101, HVIDX) %>% 
+  mutate(
+    # CASEID = HHID concatenado con HVIDX formateado a 3 caracteres (espacios a la izquierda)
+    CASEID = paste0(HHID, sprintf("%3s", HVIDX))
+  ) %>% 
+  select(-HHID, -HVIDX)
+
+full_endes_2017 <- merge(RE516171, REC83, by = "CASEID", all = TRUE) %>%
+  merge(REC84DV, by = "CASEID", all = TRUE) %>%
+  merge(REC91, by = "CASEID", all = TRUE) %>%
+  merge(REC0111, by = "CASEID", all = TRUE) %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+endes_2017 <- full_endes_2017 %>%
+  mutate(HHID = substr(CASEID, 1, 15)) %>% # Tomamos el código identificador de hogar, servirá para el merge
+  select(SPROVIN,
+         SDISTRI,
+         SREGION,
+         HHID,
+         CASEID,
+         V005, # factor de expansión
+         V001, # factor de expansión
+         V022, # factor de expansión
+         D103B, 
+         D105A:D105I, 
+         V012, 
+         V106, 
+         V133, 
+         D121, 
+         V744A:V744E, 
+         v705, 
+         V746, 
+         V701, 
+         V731, 
+         V743A:V743F, 
+         S119, 
+         D114, 
+         V102, 
+         V632,
+         V104,
+         v717,
+         V741,
+         V501, V504,
+         S325D, V743A:V743D, D101A, D101C, D101D, V739,
+         V190) # wealth index
+
+  # Luego, unimos los de nivel hogar
+hogar_2017 <- RECH23 %>%
+  full_join(RECH0, by = "HHID") # Identificador a nivel de hogar
+
+# Ahora juntamos ambos niveles de datos usando el HHID que creamos para el nivel individual
+
+endes_2017 <- endes_2017 %>%
+  left_join(hogar_2017, by = "HHID") %>%
+  left_join(RECH1,        by = "CASEID") %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+# Eliminar casos con NA en la columna longitudx
+endes_2017 <- endes_2017 %>%
+  filter(!is.na(long_ccpp))
+```
+
+Nos quedamos con 34 003 casos (no necesariamente completos) en la ENDES 2017. Vamos al siguiente paso.
+
+```{r}
+# Creamos variable ubigeo usando nuestra función, a partir de 3 vars de la encuesta
+endes_2017 <- ubigeo(endes_2017)
+# Ahora podemos dejar de lado las variables que no nos dan información relevante
+endes_2017 <- endes_2017 %>% 
+  select(-c(HHID, SPROVIN, SDISTRI))
+```
+
+Listo!
+
+# 2018
+
+```{r}
+
+RE516171 <- read_sav('ENDES_2018/RE516171.sav')
+REC83 <- read_sav('ENDES_2018/REC83.sav')
+REC84DV <- read_sav('ENDES_2018/REC84DV.sav')
+REC91 <- read_sav('ENDES_2018/REC91.sav')
+REC0111 <- read_sav('ENDES_2018/REC0111.sav')
+RECH1 <- read_sav('ENDES_2018/RECH1.sav')
+
+RECH23 = import("ENDES_2018/RECH23.SAV")%>% 
+  select(HHID, # identificador
+         HV206) # ss bb 
+RECH0 = import("ENDES_2018/RECH0.SAV")%>% 
+  select(HHID, HV024,
+        longitudx, 
+        latitudy)
+RECH1 <- import("ENDES_2018/RECH1.SAV") %>% 
+  select(HHID, HV101, HVIDX) %>% 
+  mutate(
+    # CASEID = HHID concatenado con HVIDX formateado a 3 caracteres (espacios a la izquierda)
+    CASEID = paste0(HHID, sprintf("%3s", HVIDX))
+  ) %>% 
+  select(-HHID, -HVIDX)
+
+
+full_endes_2018 <- merge(RE516171, REC83, by = "CASEID", all = TRUE) %>%
+  merge(REC84DV, by = "CASEID", all = TRUE) %>%
+  merge(REC91, by = "CASEID", all = TRUE) %>%
+  merge(REC0111, by = "CASEID", all = TRUE) %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+
+endes_2018 <- full_endes_2018 %>%
+  mutate(HHID = substr(CASEID, 1, 15)) %>% # Tomamos el código identificador de hogar, servirá para el merge
+  select(SPROVIN,
+         SDISTRI,
+         SREGION,
+         HHID,
+         CASEID,
+         V005, # factor de expansión
+         V001, # factor de expansión
+         V022, # factor de expansión
+         D103B, 
+         D105A:D105I, 
+         V012, 
+         V106, 
+         V133, 
+         D121, 
+         V744A:V744E, 
+         V705, # Vuelve a ser V mayúscula
+         V746, 
+         V701, 
+         V731, 
+         V743A:V743F, 
+         S119, 
+         D114, 
+         V102, 
+         V632,
+         V104,
+         V717,
+         V741,
+         V501, V504,
+         S325D, V743A:V743D, D101A, D101C, D101D, V739,
+         V190) # W I
+
+# Luego, unimos los de nivel hogar
+hogar_2018 <- RECH23 %>%
+  full_join(RECH0, by = "HHID") # Identificador a nivel de hogar
+
+# Ahora juntamos ambos niveles de datos usando el HHID que creamos para el nivel individual
+
+endes_2018 <- endes_2018 %>%
+  left_join(hogar_2018, by = "HHID") %>%
+  left_join(RECH1,        by = "CASEID") %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+# Eliminar casos con NA en la columna longitudx
+endes_2018 <- endes_2018 %>%
+  filter(!is.na(longitudx))
+```
+
+```{r}
+sum(is.na(endes_2018$HV024))
+```
+Vamos al siguiente paso.
+
+```{r}
+#sum(is.na(endes_2018$SDISTRI))
+#sum(is.na(endes_2018$SPROVIN))
+# tenemos varios NAs este año a diferencia de los anteriores, así que filtramos casos con NAs en esas vars.
+endes_2018 <- endes_2018 %>%
+  filter(!is.na(SDISTRI))
+
+# Ahora sí, creamos variable ubigeo usando nuestra función, a partir de 3 vars de la encuesta
+endes_2018 <- ubigeo(endes_2018)
+# Ahora podemos dejar de lado las variables que no nos dan información relevante
+endes_2018 <- endes_2018 %>% 
+  select(-c(HHID, SPROVIN, SDISTRI))
+```
+
+Nos quedamos con 38 777 casos (no necesariamente completos) en la ENDES 2018.
+Listo! 
+
+# 2019
+
+```{r}
+
+RE516171 <- read_sav('ENDES_2019/RE516171.sav')
+REC83 <- read_sav('ENDES_2019/REC83.sav')
+REC84DV <- read_sav('ENDES_2019/REC84DV.sav')
+REC91 <- read_sav('ENDES_2019/REC91.sav')
+REC0111 <- read_sav('ENDES_2019/REC0111.sav')
+RECH1 <- read_sav('ENDES_2019/RECH1.sav')
+
+RECH23 = import("ENDES_2019/RECH23.SAV")%>% 
+  select(HHID, # identificador
+         HV206) # ss bb 
+
+RECH0 = import("ENDES_2019/RECH0.SAV")%>% 
+  select(HHID, HV024, # identificador y reg
+        UBIGEO,
+        longitudx, 
+        latitudy)
+RECH1 <- import("ENDES_2019/RECH1.SAV") %>% 
+  select(HHID, HV101, HVIDX) %>% 
+  mutate(
+    # CASEID = HHID concatenado con HVIDX formateado a 3 caracteres (espacios a la izquierda)
+    CASEID = paste0(HHID, sprintf("%3s", HVIDX))
+  ) %>% 
+  select(-HHID, -HVIDX)
+
+full_endes_2019 <- merge(RE516171, REC83, by = "CASEID", all = TRUE) %>%
+  merge(REC84DV, by = "CASEID", all = TRUE) %>%
+  merge(REC91, by = "CASEID", all = TRUE) %>%
+  merge(REC0111, by = "CASEID", all = TRUE) %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+endes_2019 <- full_endes_2019 %>%
+  select(HHID, # aquí no necesitamos reconstruir el ubigeo
+         SREGION,
+         CASEID,
+         V005, # factor de expansión
+         V001, # factor de expansión
+         V022, # factor de expansión
+         D103B, 
+         D105A:D105I, 
+         V012, 
+         V106, 
+         V133, 
+         D121, 
+         V744A:V744E, 
+         V705, # Vuelve a ser V mayúscula
+         V746, 
+         V701, 
+         V731, 
+         V743A:V743F, 
+         S119, 
+         D114, 
+         V102, 
+         V632,
+         V104,
+         V717,
+         V741,
+         V501, V504,
+         S325D, V743A:V743D, D101A, D101C, D101D, V739,
+         V190) # w i
+
+# Luego, unimos los de nivel hogar
+hogar_2019 <- RECH23 %>%
+  full_join(RECH0, by = "HHID") # Identificador a nivel de hogar
+
+# Ahora juntamos ambos niveles de datos usando el HHID que creamos para el nivel individual
+
+endes_2019 <- endes_2019 %>%
+  left_join(hogar_2019, by = "HHID") %>%
+  left_join(RECH1,        by = "CASEID") %>%
+  distinct(CASEID, .keep_all = TRUE)
+
+# Eliminar casos con NA en la columna de identificador de la entrevistada
+endes_2019 <- endes_2019 %>%
+  filter(!is.na(CASEID))
+
+endes_2019 <- endes_2019 %>% 
+  select(-HHID)
+
+```
+
+Nos quedamos con 38 335 observaciones en 2019.
+
+# Unión de todos los años
+
+Dado que nuestra data minera está en formato anidado, debemos aplicar lo mismo a nuestras ENDES antes de exportarlas.
+
+```{r}
+endes_2015$año <- 2015
+endes_2016$año  <- 2016
+endes_2017$año  <- 2017
+endes_2018$año  <- 2018
+endes_2019$año  <- 2019
+```
+
+
+```{r}
+# Ajustamos detalles (homogenizar nombres para poder hacer Rbind)
+endes_2017 = endes_2017 %>%
+  rename(V705 = v705,
+         V717 = v717,
+         longitudx = long_ccpp, 
+         latitudy = lat_ccpp)
+endes_2016 = endes_2016 %>%
+  rename(V005 = v005)
+endes_2019 = endes_2019 %>%
+  rename(ubigeo = UBIGEO)
+
+# lo siguiente lo hacemos porque algunas variables tienen diferentes etiquetas (o no las tienen) entre los años. No es lo ideal porque perdemos la información sobre las variables pero es lo más rápido por ahora. La alternativa es observar detalladamente cuáles son esas variables y cambiar solo esas en todos los años (hacer numéricas) para no perder las etiquetas en las demás variables.
+
+endes_2015 <- endes_2015 %>% mutate(across(where(is.labelled), as.numeric))
+endes_2016 <- endes_2016 %>% mutate(across(where(is.labelled), as.numeric))
+endes_2017 <- endes_2017 %>% mutate(across(where(is.labelled), as.numeric))
+endes_2018 <- endes_2018 %>% mutate(across(where(is.labelled), as.numeric))
+endes_2019 <- endes_2019 %>% mutate(across(where(is.labelled), as.numeric))
+
+# Ahora sí, a unir:
+
+endes_full <- rbind(endes_2015, 
+                    endes_2016, 
+                    endes_2017, 
+                    endes_2018, 
+                    endes_2019)
+```
+```{r}
+
+# en caso que el Rbind no funcione, siempre podemos chequear las diferencias entre los dfs
+# setdiff(colnames(endes_2017), colnames(endes_2018))
+
+```
+Listo! Exportamos
+
+```{r}
+ 
+write.csv(endes_full,"outcomes_endes_15_19.csv", row.names = FALSE)
+
+```
+
+
+
